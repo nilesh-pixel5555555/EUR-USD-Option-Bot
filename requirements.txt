@@ -1,7 +1,8 @@
-python-telegram-bot==20.7
-pandas==2.1.4
-numpy==1.26.2
-yfinance==0.2.33
-ta==0.11.0
-asyncio==3.4.3
-python-dateutil==2.8.2
+python-telegram-bot
+pandas
+pandas_ta
+yfinance
+schedule
+python-dotenv
+flask
+gunicorn
