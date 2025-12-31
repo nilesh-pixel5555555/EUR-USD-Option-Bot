@@ -3,32 +3,42 @@ import time
 import schedule
 import logging
 import yfinance as yf
-import pandas as pd
 import pandas_ta as ta
 import asyncio
 from telegram import Bot
 from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
 
 # --- SETUP ---
 load_dotenv()
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
 
-# Logging for professional monitoring
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-SYMBOL = "EURUSD=X"  # Yahoo Finance symbol for EUR/USD
-TIMEFRAME = "5m"     # 5 Minute candles
+SYMBOL = "EURUSD=X"
+TIMEFRAME = "5m"
 RSI_PERIOD = 14
 EMA_PERIOD = 50
 
+# --- FLASK SERVER (To Keep Render Alive) ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    # Render assigns a port in the PORT env var, default to 10000
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# --- BOT LOGIC ---
 async def send_telegram_message(message):
-    """Sends the formatted signal to the Telegram Channel."""
     try:
         bot = Bot(token=BOT_TOKEN)
         await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='Markdown')
@@ -37,31 +47,20 @@ async def send_telegram_message(message):
         logger.error(f"Failed to send message: {e}")
 
 def get_market_data():
-    """Fetches the last day of 5-minute data."""
     try:
-        # Fetching slightly more data to ensure MA calculation is accurate
         df = yf.download(tickers=SYMBOL, period="1d", interval=TIMEFRAME, progress=False)
-        if df.empty:
-            logger.warning("Empty dataframe received.")
-            return None
+        if df.empty: return None
         return df
-    except Exception as e:
-        logger.error(f"Error fetching data: {e}")
+    except Exception:
         return None
 
 def analyze_market():
-    """Applies the strategy and returns a signal if found."""
     df = get_market_data()
-    
-    if df is None or len(df) < EMA_PERIOD:
-        return None
+    if df is None or len(df) < EMA_PERIOD: return None
 
-    # Calculate Indicators
-    # Using pandas_ta for professional calculation
     df['RSI'] = ta.rsi(df['Close'], length=RSI_PERIOD)
     df['EMA'] = ta.ema(df['Close'], length=EMA_PERIOD)
 
-    # Get the last completed candle (index -2) because index -1 is the current forming candle
     last_candle = df.iloc[-2]
     prev_candle = df.iloc[-3]
     
@@ -72,17 +71,10 @@ def analyze_market():
 
     signal = None
 
-    # --- STRATEGY LOGIC ---
-    
-    # CALL SCENARIO: Uptrend (Price > EMA) + RSI crossing upward
-    if current_price > ema_value:
-        if prev_rsi < 30 and current_rsi >= 30:
-            signal = "CALL 🟢"
-
-    # PUT SCENARIO: Downtrend (Price < EMA) + RSI crossing downward
-    elif current_price < ema_value:
-        if prev_rsi > 70 and current_rsi <= 70:
-            signal = "PUT 🔴"
+    if current_price > ema_value and prev_rsi < 30 and current_rsi >= 30:
+        signal = "CALL 🟢"
+    elif current_price < ema_value and prev_rsi > 70 and current_rsi <= 70:
+        signal = "PUT 🔴"
 
     if signal:
         return {
@@ -94,35 +86,31 @@ def analyze_market():
     return None
 
 def job():
-    """The main job running every 5 minutes."""
     logger.info("Analyzing market...")
     result = analyze_market()
-
     if result:
         message = (
-            f"⚡ **BINARY SIGNAL** ⚡\n\n"
+            f"⚡ **BINARY SIGNAL** ⚡\n"
             f"Pair: **EUR/USD**\n"
             f"Action: **{result['signal']}**\n"
             f"Time: {result['time']}\n"
-            f"Price: {result['price']}\n\n"
-            f"⚠️ _Expiry: 5 Minutes_"
+            f"Price: {result['price']}"
         )
-        # Using asyncio to run the async telegram function
         asyncio.run(send_telegram_message(message))
-    else:
-        logger.info("No signal found this cycle.")
 
-# --- EXECUTION ---
-if __name__ == "__main__":
-    logger.info("Bot started. Waiting for next 5 min interval...")
-    
-    # Schedule the job every 5 minutes
-    # Note: To sync with candle close, in production you might use a more precise timer
+def run_scheduler():
     schedule.every(5).minutes.do(job)
-
-    # Run immediately once for testing
-    job()
-
+    # Run once on start
+    job() 
     while True:
         schedule.run_pending()
         time.sleep(1)
+
+# --- EXECUTION ---
+if __name__ == "__main__":
+    # Start Flask in a separate thread
+    t = Thread(target=run_flask)
+    t.start()
+    
+    # Start the Bot
+    run_scheduler()
