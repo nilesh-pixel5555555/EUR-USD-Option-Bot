@@ -1,493 +1,311 @@
-# main.py - PREMIER FOREX AI QUANT V2.5 (Render Optimized with Performance Tracking)
-
-import os
-import ccxt
+import asyncio
 import pandas as pd
 import numpy as np
-import asyncio
 from datetime import datetime, timedelta
-from apscheduler.schedulers.background import BackgroundScheduler
+import logging
+import os
+from dotenv import load_dotenv
 from telegram import Bot
-from flask import Flask, jsonify, render_template_string
-import threading
-import time
-import traceback 
-import json
+from telegram.error import TelegramError
+import yfinance as yf
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import MACD, EMAIndicator
+from ta.volatility import BollingerBands
 
-# --- ML Imports ---
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler 
+# Load environment variables
+load_dotenv()
 
-# --- CONFIGURATION ---
-from dotenv import load_dotenv 
-load_dotenv() 
+# Configure logging
+log_level = os.getenv('LOG_LEVEL', 'INFO')
+logging.basicConfig(
+    level=getattr(logging, log_level),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-FOREX_PAIRS = [p.strip() for p in os.getenv("FOREX_PAIRS", "EUR/USD,GBP/USD,USD/JPY,AUD/USD,USD/CHF").split(',')]
-TIMEFRAME_MAIN = "4h"  # Major Trend
-TIMEFRAME_ENTRY = "1h" # Entry Precision
-
-# Initialize Bot and Exchange (Defaulting to Kraken for India/Forex Stability)
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-exchange = ccxt.kraken({
-    'enableRateLimit': True, 
-    'rateLimit': 2000,
-    'params': {'timeout': 20000} # Explicit 20s timeout
-})
-
-bot_stats = {
-    "status": "initializing",
-    "total_analyses": 0,
-    "last_analysis": None,
-    "monitored_assets": FOREX_PAIRS,
-    "uptime_start": datetime.now().isoformat(),
-    "version": "V2.5 Forex Elite Quant + Performance Tracker"
-}
-
-# === TRADE TRACKING SYSTEM ===
-trade_history = []  # Stores all trades with their outcomes
-TRADE_HISTORY_FILE = "forex_trade_history.json"
-
-def load_trade_history():
-    """Load trade history from file on startup."""
-    global trade_history
-    try:
-        if os.path.exists(TRADE_HISTORY_FILE):
-            with open(TRADE_HISTORY_FILE, 'r') as f:
-                trade_history = json.load(f)
-                print(f"📊 Loaded {len(trade_history)} historical forex trades")
-    except Exception as e:
-        print(f"⚠️ Could not load trade history: {e}")
-        trade_history = []
-
-def save_trade_history():
-    """Save trade history to file."""
-    try:
-        with open(TRADE_HISTORY_FILE, 'w') as f:
-            json.dump(trade_history, f, indent=2)
-    except Exception as e:
-        print(f"⚠️ Could not save trade history: {e}")
-
-def add_trade(symbol, signal, entry_price, tp1, tp2, sl, trend_4h, trend_1h):
-    """Add a new trade to tracking system."""
-    trade = {
-        "id": len(trade_history) + 1,
-        "symbol": symbol,
-        "signal": signal,
-        "entry_price": entry_price,
-        "tp1": tp1,
-        "tp2": tp2,
-        "sl": sl,
-        "trend_4h": trend_4h,
-        "trend_1h": trend_1h,
-        "timestamp": datetime.now().isoformat(),
-        "status": "ACTIVE",  # ACTIVE, TP1_HIT, TP2_HIT, SL_HIT
-        "outcome": None,  # Will be: "WIN", "LOSS", "PARTIAL_WIN"
-        "profit_loss_pips": 0.0,
-        "profit_loss_pct": 0.0
-    }
-    trade_history.append(trade)
-    save_trade_history()
-    return trade
-
-def calculate_pips(symbol, price1, price2):
-    """Calculate pip difference for forex pairs."""
-    pip_value = 0.01 if 'JPY' in symbol else 0.0001
-    return abs(price2 - price1) / pip_value
-
-def check_trade_outcomes():
-    """Check all active trades and update their status."""
-    global trade_history
-    updated = False
-    
-    for trade in trade_history:
-        if trade['status'] == 'ACTIVE':
-            try:
-                # Fetch current price
-                df = fetch_data_safe(trade['symbol'], '1h')
-                if df.empty:
-                    continue
-                
-                current_price = df.iloc[-1]['close']
-                entry = trade['entry_price']
-                is_buy = "BUY" in trade['signal']
-                
-                # Check if targets or stop loss hit
-                if is_buy:
-                    if current_price >= trade['tp2']:
-                        trade['status'] = 'TP2_HIT'
-                        trade['outcome'] = 'WIN'
-                        trade['profit_loss_pips'] = calculate_pips(trade['symbol'], entry, trade['tp2'])
-                        trade['profit_loss_pct'] = ((trade['tp2'] - entry) / entry) * 100
-                        updated = True
-                    elif current_price >= trade['tp1']:
-                        trade['status'] = 'TP1_HIT'
-                        trade['outcome'] = 'PARTIAL_WIN'
-                        trade['profit_loss_pips'] = calculate_pips(trade['symbol'], entry, trade['tp1'])
-                        trade['profit_loss_pct'] = ((trade['tp1'] - entry) / entry) * 100
-                        updated = True
-                    elif current_price <= trade['sl']:
-                        trade['status'] = 'SL_HIT'
-                        trade['outcome'] = 'LOSS'
-                        trade['profit_loss_pips'] = -calculate_pips(trade['symbol'], entry, trade['sl'])
-                        trade['profit_loss_pct'] = ((trade['sl'] - entry) / entry) * 100
-                        updated = True
-                else:  # SELL
-                    if current_price <= trade['tp2']:
-                        trade['status'] = 'TP2_HIT'
-                        trade['outcome'] = 'WIN'
-                        trade['profit_loss_pips'] = calculate_pips(trade['symbol'], trade['tp2'], entry)
-                        trade['profit_loss_pct'] = ((entry - trade['tp2']) / entry) * 100
-                        updated = True
-                    elif current_price <= trade['tp1']:
-                        trade['status'] = 'TP1_HIT'
-                        trade['outcome'] = 'PARTIAL_WIN'
-                        trade['profit_loss_pips'] = calculate_pips(trade['symbol'], trade['tp1'], entry)
-                        trade['profit_loss_pct'] = ((entry - trade['tp1']) / entry) * 100
-                        updated = True
-                    elif current_price >= trade['sl']:
-                        trade['status'] = 'SL_HIT'
-                        trade['outcome'] = 'LOSS'
-                        trade['profit_loss_pips'] = -calculate_pips(trade['symbol'], trade['sl'], entry)
-                        trade['profit_loss_pct'] = ((entry - trade['sl']) / entry) * 100
-                        updated = True
-                        
-            except Exception as e:
-                print(f"Error checking forex trade {trade['id']}: {e}")
-    
-    if updated:
-        save_trade_history()
-
-def generate_daily_report():
-    """Generate and send 24-hour forex performance report."""
-    try:
-        # First, update all trade outcomes
-        check_trade_outcomes()
+class BinaryOptionsBot:
+    def __init__(self, telegram_token, channel_id, symbol="EURUSD=X", min_confidence=60):
+        """
+        Initialize the Binary Options Trading Bot
         
-        # Get trades from last 24 hours
-        now = datetime.now()
-        last_24h = now - timedelta(hours=24)
+        Args:
+            telegram_token (str): Telegram bot token
+            channel_id (str): Telegram channel ID (e.g., @yourchannel or -1001234567890)
+            symbol (str): Trading symbol (default: EURUSD=X)
+            min_confidence (int): Minimum confidence percentage (default: 60)
+        """
+        self.bot = Bot(token=telegram_token)
+        self.channel_id = channel_id
+        self.symbol = symbol
+        self.interval = "1m"  # 1-minute data for precise analysis
+        self.min_confidence = min_confidence
         
-        recent_trades = [
-            t for t in trade_history 
-            if datetime.fromisoformat(t['timestamp']) >= last_24h
-        ]
-        
-        if not recent_trades:
-            message = (
-                f"╔════════════════════════════════╗\n"
-                f"  📊 <b>24-HOUR FOREX REPORT</b>\n"
-                f"╚════════════════════════════════╝\n\n"
-                f"<b>Period:</b> {last_24h.strftime('%Y-%m-%d %H:%M')} to {now.strftime('%Y-%m-%d %H:%M')}\n\n"
-                f"⚠️ No forex signals executed in the last 24 hours.\n\n"
-                f"<i>Market monitoring continues...</i>\n"
-                f"<i>Next report: {(now + timedelta(hours=24)).strftime('%d %b %H:%M')}</i>"
-            )
-        else:
-            # Calculate statistics
-            total_trades = len(recent_trades)
-            wins = len([t for t in recent_trades if t['outcome'] == 'WIN'])
-            partial_wins = len([t for t in recent_trades if t['outcome'] == 'PARTIAL_WIN'])
-            losses = len([t for t in recent_trades if t['outcome'] == 'LOSS'])
-            active = len([t for t in recent_trades if t['status'] == 'ACTIVE'])
-            
-            total_profit_pips = sum([t['profit_loss_pips'] for t in recent_trades if t['outcome'] in ['WIN', 'PARTIAL_WIN']])
-            total_loss_pips = sum([abs(t['profit_loss_pips']) for t in recent_trades if t['outcome'] == 'LOSS'])
-            net_pips = total_profit_pips - total_loss_pips
-            
-            total_profit_pct = sum([t['profit_loss_pct'] for t in recent_trades if t['outcome'] in ['WIN', 'PARTIAL_WIN']])
-            total_loss_pct = sum([abs(t['profit_loss_pct']) for t in recent_trades if t['outcome'] == 'LOSS'])
-            net_pct = total_profit_pct - total_loss_pct
-            
-            win_rate = ((wins + partial_wins) / (wins + partial_wins + losses) * 100) if (wins + partial_wins + losses) > 0 else 0
-            
-            # Build detailed message
-            message = (
-                f"╔════════════════════════════════╗\n"
-                f"  📊 <b>24-HOUR FOREX REPORT</b>\n"
-                f"╚════════════════════════════════╝\n\n"
-                f"<b>📅 Period:</b> {last_24h.strftime('%d %b %H:%M')} - {now.strftime('%d %b %H:%M')}\n\n"
-                f"<b>📈 TRADING STATISTICS:</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"• Total Signals: <b>{total_trades}</b>\n"
-                f"• ✅ Full Wins (TP2): <b>{wins}</b>\n"
-                f"• ⚡ Partial Wins (TP1): <b>{partial_wins}</b>\n"
-                f"• ❌ Losses (SL): <b>{losses}</b>\n"
-                f"• ⏳ Active Trades: <b>{active}</b>\n\n"
-                f"<b>💰 PROFIT/LOSS ANALYSIS:</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"• Win Rate: <code>{win_rate:.1f}%</code>\n"
-                f"• Total Profit: <code>+{total_profit_pips:.1f} pips</code>\n"
-                f"• Total Loss: <code>-{total_loss_pips:.1f} pips</code>\n"
-                f"• <b>Net P/L: <code>{'🟢 +' if net_pips >= 0 else '🔴 '}{net_pips:.1f} pips</code></b>\n"
-                f"• Percentage: <code>{'🟢 +' if net_pct >= 0 else '🔴 '}{net_pct:.2f}%</code>\n\n"
-            )
-            
-            # Add top trades
-            closed_trades = [t for t in recent_trades if t['outcome'] in ['WIN', 'PARTIAL_WIN', 'LOSS']]
-            if closed_trades:
-                message += f"<b>🏆 TOP PERFORMING TRADES:</b>\n"
-                message += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                sorted_trades = sorted(closed_trades, key=lambda x: x['profit_loss_pips'], reverse=True)[:3]
-                for i, t in enumerate(sorted_trades, 1):
-                    emoji = "🟢" if t['profit_loss_pips'] > 0 else "🔴"
-                    message += f"{i}. {t['symbol']} - {emoji} {t['profit_loss_pips']:+.1f} pips ({t['outcome']})\n"
-                message += "\n"
-            
-            # Add active trades info
-            if active > 0:
-                message += f"<b>⏳ ACTIVE POSITIONS:</b>\n"
-                message += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                active_trades = [t for t in recent_trades if t['status'] == 'ACTIVE']
-                for t in active_trades[:5]:  # Show all active (max 5)
-                    decimals = 3 if 'JPY' in t['symbol'] else 5
-                    message += f"• {t['symbol']} - {t['signal']} @ {t['entry_price']:.{decimals}f}\n"
-                message += "\n"
-            
-            # Performance by pair
-            pair_performance = {}
-            for t in closed_trades:
-                if t['symbol'] not in pair_performance:
-                    pair_performance[t['symbol']] = {'pips': 0, 'trades': 0}
-                pair_performance[t['symbol']]['pips'] += t['profit_loss_pips']
-                pair_performance[t['symbol']]['trades'] += 1
-            
-            if pair_performance:
-                message += f"<b>📊 PERFORMANCE BY PAIR:</b>\n"
-                message += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                for pair, data in sorted(pair_performance.items(), key=lambda x: x[1]['pips'], reverse=True):
-                    emoji = "🟢" if data['pips'] > 0 else "🔴"
-                    message += f"• {pair}: {emoji} {data['pips']:+.1f} pips ({data['trades']} trades)\n"
-                message += "\n"
-            
-            message += (
-                f"----------------------------------------\n"
-                f"<i>Next report: {(now + timedelta(hours=24)).strftime('%d %b %H:%M')}</i>\n"
-                f"<i>Verified AI Forex Analysis V2.5 Elite</i>"
-            )
-        
-        # Send report
-        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
-        print(f"✅ Daily forex report sent at {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        
-    except Exception as e:
-        print(f"❌ Failed to generate daily forex report: {e}")
-        traceback.print_exc()
-
-# =========================================================================
-# === ADVANCED QUANT LOGIC ===
-# =========================================================================
-
-def get_pip_value(pair):
-    return 0.01 if 'JPY' in pair else 0.0001
-
-def calculate_cpr_levels(df_daily):
-    """Calculates Pivot Points for Institutional Target Setting."""
-    if df_daily.empty or len(df_daily) < 2: return None
-    prev_day = df_daily.iloc[-2]
-    H, L, C = prev_day['high'], prev_day['low'], prev_day['close']
-    PP = (H + L + C) / 3.0
-    BC = (H + L) / 2.0
-    TC = PP - BC + PP
-    return {
-        'PP': PP, 'TC': TC, 'BC': BC,
-        'R1': 2*PP - L, 'S1': 2*PP - H,
-        'R2': PP + (H - L), 'S2': PP - (H - L)
-    }
-
-def fetch_data_safe(symbol, timeframe):
-    """Robust fetcher with retries and symbol ID normalization."""
-    max_retries = 3
-    for attempt in range(max_retries):
+    def fetch_market_data(self, period="1d"):
+        """Fetch real-time market data for EUR/USD"""
         try:
-            if not exchange.markets: exchange.load_markets()
-            market_id = exchange.market(symbol)['id']
-            ohlcv = exchange.fetch_ohlcv(market_id, timeframe, limit=100)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            df['sma9'] = df['close'].rolling(9).mean()
-            df['sma20'] = df['close'].rolling(20).mean()
-            return df.dropna()
-        except Exception:
-            if attempt < max_retries - 1: time.sleep(5)
-    return pd.DataFrame()
-
-# =========================================================================
-# === MULTI-TIMEFRAME CONFLUENCE ENGINE ===
-# =========================================================================
-
-def generate_and_send_signal(symbol):
-    global bot_stats
-    try:
-        # 1. Multi-Timeframe Confluence
-        df_4h = fetch_data_safe(symbol, TIMEFRAME_MAIN)
-        df_1h = fetch_data_safe(symbol, TIMEFRAME_ENTRY)
-        
-        # 2. Daily Data for CPR Targets
-        if not exchange.markets: exchange.load_markets()
-        market_id = exchange.market(symbol)['id']
-        ohlcv_d = exchange.fetch_ohlcv(market_id, '1d', limit=5)
-        df_d = pd.DataFrame(ohlcv_d, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        cpr = calculate_cpr_levels(df_d)
-
-        if df_4h.empty or df_1h.empty or cpr is None: return
-
-        # 3. Analyze Trend Confluence
-        price = df_4h.iloc[-1]['close']
-        trend_4h = "BULLISH" if df_4h.iloc[-1]['sma9'] > df_4h.iloc[-1]['sma20'] else "BEARISH"
-        trend_1h = "BULLISH" if df_1h.iloc[-1]['sma9'] > df_1h.iloc[-1]['sma20'] else "BEARISH"
-        
-        # 4. Master Logic
-        signal = "HOLD / WAIT"
-        emoji = "⏳"
-        
-        if trend_4h == "BULLISH" and trend_1h == "BULLISH" and price > cpr['PP']:
-            signal = "STRONG BUY"
-            emoji = "🚀"
-        elif trend_4h == "BEARISH" and trend_1h == "BEARISH" and price < cpr['PP']:
-            signal = "STRONG SELL"
-            emoji = "🔻"
-
-        # 5. Risk Management Targets
-        is_buy = "BUY" in signal
-        tp1 = cpr['R1'] if is_buy else cpr['S1']
-        tp2 = cpr['R2'] if is_buy else cpr['S2']
-        sl = min(cpr['BC'], cpr['TC']) if is_buy else max(cpr['BC'], cpr['TC'])
-        
-        decimals = 3 if 'JPY' in symbol else 5
-
-        # === Track trade if it's a BUY/SELL signal ===
-        if "BUY" in signal or "SELL" in signal:
-            add_trade(symbol, signal, price, tp1, tp2, sl, trend_4h, trend_1h)
-            
-            # Calculate pip targets
-            tp1_pips = calculate_pips(symbol, price, tp1)
-            tp2_pips = calculate_pips(symbol, price, tp2)
-            sl_pips = calculate_pips(symbol, price, sl)
-
-        # --- PREMIUM SIGNAL TEMPLATE ---
-        message = (
-            f"╔════════════════════════════════╗\n"
-            f"  🌍 <b>PREMIER FOREX AI QUANT</b>\n"
-            f"╚════════════════════════════════╝\n\n"
-            f"<b>Pair:</b> {symbol}\n"
-            f"<b>Rate:</b> <code>{price:.{decimals}f}</code>\n\n"
-            f"--- 🚨 {emoji} <b>SIGNAL: {signal}</b> 🚨 ---\n\n"
-            f"<b>📈 CONFLUENCE ANALYSIS:</b>\n"
-            f"• 4H Trend: <code>{trend_4h}</code>\n"
-            f"• 1H Trend: <code>{trend_1h}</code>\n"
-            f"• Pivot: {'Above' if price > cpr['PP'] else 'Below'} PP\n\n"
-        )
-        
-        if "BUY" in signal or "SELL" in signal:
-            message += (
-                f"<b>🎯 TARGET LEVELS:</b>\n"
-                f"✅ <b>Take Profit 1:</b> <code>{tp1:.{decimals}f}</code> (+{tp1_pips:.1f} pips)\n"
-                f"🔥 <b>Take Profit 2:</b> <code>{tp2:.{decimals}f}</code> (+{tp2_pips:.1f} pips)\n"
-                f"🛑 <b>Stop Loss:</b> <code>{sl:.{decimals}f}</code> (-{sl_pips:.1f} pips)\n"
-                f"<b>Risk/Reward:</b> <code>1:{(tp2_pips/sl_pips):.2f}</code>\n\n"
+            data = yf.download(
+                self.symbol,
+                period=period,
+                interval=self.interval,
+                progress=False
             )
+            if data.empty:
+                logger.error("No data fetched from yfinance")
+                return None
+            return data
+        except Exception as e:
+            logger.error(f"Error fetching market data: {e}")
+            return None
+    
+    def calculate_indicators(self, df):
+        """Calculate technical indicators for signal generation"""
+        try:
+            # RSI (Relative Strength Index)
+            rsi = RSIIndicator(close=df['Close'], window=14)
+            df['RSI'] = rsi.rsi()
+            
+            # MACD (Moving Average Convergence Divergence)
+            macd = MACD(close=df['Close'])
+            df['MACD'] = macd.macd()
+            df['MACD_Signal'] = macd.macd_signal()
+            df['MACD_Diff'] = macd.macd_diff()
+            
+            # EMA (Exponential Moving Average)
+            ema_9 = EMAIndicator(close=df['Close'], window=9)
+            ema_21 = EMAIndicator(close=df['Close'], window=21)
+            df['EMA_9'] = ema_9.ema_indicator()
+            df['EMA_21'] = ema_21.ema_indicator()
+            
+            # Bollinger Bands
+            bollinger = BollingerBands(close=df['Close'], window=20, window_dev=2)
+            df['BB_High'] = bollinger.bollinger_hband()
+            df['BB_Low'] = bollinger.bollinger_lband()
+            df['BB_Mid'] = bollinger.bollinger_mavg()
+            
+            # Stochastic Oscillator
+            stoch = StochasticOscillator(
+                high=df['High'],
+                low=df['Low'],
+                close=df['Close'],
+                window=14,
+                smooth_window=3
+            )
+            df['Stoch_K'] = stoch.stoch()
+            df['Stoch_D'] = stoch.stoch_signal()
+            
+            return df
+        except Exception as e:
+            logger.error(f"Error calculating indicators: {e}")
+            return None
+    
+    def generate_signal(self, df):
+        """
+        Generate trading signal based on multiple indicator confluence
         
-        message += (
-            f"----------------------------------------\n"
-            f"<i>Verified AI Forex Analysis V2.5 Elite</i>"
-        )
-
-        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
+        Returns:
+            dict: Signal information with direction, confidence, and reasoning
+        """
+        if df is None or len(df) < 30:
+            return None
         
-        bot_stats['total_analyses'] += 1
-        bot_stats['last_analysis'] = datetime.now().isoformat()
-        bot_stats['status'] = "operational"
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        call_score = 0
+        put_score = 0
+        reasons = []
+        
+        # RSI Analysis (30% weight)
+        if latest['RSI'] < 30:
+            call_score += 3
+            reasons.append("RSI Oversold (<30)")
+        elif latest['RSI'] > 70:
+            put_score += 3
+            reasons.append("RSI Overbought (>70)")
+        elif latest['RSI'] < 40 and prev['RSI'] < latest['RSI']:
+            call_score += 1
+            reasons.append("RSI Bullish Momentum")
+        elif latest['RSI'] > 60 and prev['RSI'] > latest['RSI']:
+            put_score += 1
+            reasons.append("RSI Bearish Momentum")
+        
+        # MACD Analysis (25% weight)
+        if latest['MACD_Diff'] > 0 and prev['MACD_Diff'] <= 0:
+            call_score += 2.5
+            reasons.append("MACD Bullish Crossover")
+        elif latest['MACD_Diff'] < 0 and prev['MACD_Diff'] >= 0:
+            put_score += 2.5
+            reasons.append("MACD Bearish Crossover")
+        elif latest['MACD_Diff'] > 0:
+            call_score += 0.5
+        elif latest['MACD_Diff'] < 0:
+            put_score += 0.5
+        
+        # EMA Trend Analysis (20% weight)
+        if latest['EMA_9'] > latest['EMA_21'] and latest['Close'] > latest['EMA_9']:
+            call_score += 2
+            reasons.append("Strong Bullish Trend (EMA)")
+        elif latest['EMA_9'] < latest['EMA_21'] and latest['Close'] < latest['EMA_9']:
+            put_score += 2
+            reasons.append("Strong Bearish Trend (EMA)")
+        
+        # Bollinger Bands Analysis (15% weight)
+        if latest['Close'] < latest['BB_Low']:
+            call_score += 1.5
+            reasons.append("Price Below Lower BB")
+        elif latest['Close'] > latest['BB_High']:
+            put_score += 1.5
+            reasons.append("Price Above Upper BB")
+        
+        # Stochastic Analysis (10% weight)
+        if latest['Stoch_K'] < 20 and latest['Stoch_K'] > prev['Stoch_K']:
+            call_score += 1
+            reasons.append("Stochastic Oversold Reversal")
+        elif latest['Stoch_K'] > 80 and latest['Stoch_K'] < prev['Stoch_K']:
+            put_score += 1
+            reasons.append("Stochastic Overbought Reversal")
+        
+        # Determine signal
+        total_score = call_score + put_score
+        if total_score < 3:
+            return None  # Not enough confluence
+        
+        if call_score > put_score:
+            signal_type = "CALL"
+            confidence = min(95, int((call_score / 10) * 100))
+        else:
+            signal_type = "PUT"
+            confidence = min(95, int((put_score / 10) * 100))
+        
+        # Require minimum confidence
+        if confidence < self.min_confidence:
+            return None
+        
+        return {
+            'type': signal_type,
+            'confidence': confidence,
+            'reasons': reasons[:3],  # Top 3 reasons
+            'price': latest['Close'],
+            'time': datetime.now()
+        }
+    
+    def format_signal_message(self, signal):
+        """Format the trading signal for Telegram"""
+        emoji = "🟢" if signal['type'] == "CALL" else "🔴"
+        
+        message = f"""
+{emoji} **BINARY OPTIONS SIGNAL** {emoji}
 
+📊 **Pair:** EUR/USD
+⏱ **Expiry:** 5 Minutes
+📈 **Signal:** {signal['type']}
+💰 **Entry Price:** {signal['price']:.5f}
+🎯 **Confidence:** {signal['confidence']}%
+
+**Analysis:**
+"""
+        for reason in signal['reasons']:
+            message += f"✓ {reason}\n"
+        
+        message += f"\n⏰ **Time:** {signal['time'].strftime('%H:%M:%S UTC')}"
+        message += "\n\n⚠️ *Trade at your own risk. This is not financial advice.*"
+        
+        return message
+    
+    async def send_signal(self, signal):
+        """Send signal to Telegram channel"""
+        try:
+            message = self.format_signal_message(signal)
+            await self.bot.send_message(
+                chat_id=self.channel_id,
+                text=message,
+                parse_mode='Markdown'
+            )
+            logger.info(f"Signal sent: {signal['type']} at {signal['price']:.5f}")
+            return True
+        except TelegramError as e:
+            logger.error(f"Error sending Telegram message: {e}")
+            return False
+    
+    async def run(self):
+        """Main bot loop - sends signals every 5 minutes"""
+        logger.info("Binary Options Bot Started!")
+        logger.info(f"Monitoring: {self.symbol}")
+        logger.info(f"Signal Interval: 5 minutes")
+        
+        # Send startup message
+        try:
+            await self.bot.send_message(
+                chat_id=self.channel_id,
+                text="🤖 **Binary Options Signal Bot Started**\n\n"
+                     "📊 Pair: EUR/USD\n"
+                     "⏱ Timeframe: 5 Minutes\n"
+                     "🎯 Strategy: Multi-Indicator Confluence\n\n"
+                     "Signals will be sent every 5 minutes.",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Error sending startup message: {e}")
+        
+        while True:
+            try:
+                # Wait until next 5-minute mark
+                now = datetime.now()
+                next_signal = now + timedelta(minutes=5 - now.minute % 5, 
+                                              seconds=-now.second,
+                                              microseconds=-now.microsecond)
+                wait_seconds = (next_signal - now).total_seconds()
+                
+                if wait_seconds > 0:
+                    logger.info(f"Next signal in {int(wait_seconds)} seconds...")
+                    await asyncio.sleep(wait_seconds)
+                
+                # Fetch data and generate signal
+                logger.info("Analyzing market data...")
+                df = self.fetch_market_data(period="1d")
+                
+                if df is not None:
+                    df = self.calculate_indicators(df)
+                    if df is not None:
+                        signal = self.generate_signal(df)
+                        
+                        if signal:
+                            await self.send_signal(signal)
+                        else:
+                            logger.info("No high-confidence signal at this time")
+                
+            except Exception as e:
+                logger.error(f"Error in main loop: {e}")
+                await asyncio.sleep(60)  # Wait 1 minute on error
+
+async def main():
+    # Load configuration from environment variables
+    TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+    CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
+    SYMBOL = os.getenv('SYMBOL', 'EURUSD=X')
+    MIN_CONFIDENCE = int(os.getenv('MIN_CONFIDENCE', '60'))
+    
+    # Validate configuration
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not set in environment variables!")
+        logger.info("Create a .env file and add: TELEGRAM_BOT_TOKEN=your_token")
+        logger.info("Get token from @BotFather on Telegram")
+        return
+    
+    if not CHANNEL_ID:
+        logger.error("TELEGRAM_CHANNEL_ID not set in environment variables!")
+        logger.info("Create a .env file and add: TELEGRAM_CHANNEL_ID=@your_channel")
+        logger.info("Add your bot as admin to the channel first")
+        return
+    
+    # Initialize and run bot
+    bot = BinaryOptionsBot(TELEGRAM_TOKEN, CHANNEL_ID, SYMBOL, MIN_CONFIDENCE)
+    await bot.run()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
     except Exception as e:
-        print(f"❌ Analysis failed: {e}")
-
-# =========================================================================
-# === GUNICORN-SAFE INITIALIZATION ===
-# =========================================================================
-
-def start_bot():
-    print(f"🚀 Initializing {bot_stats['version']}...")
-    
-    # Load historical trades
-    load_trade_history()
-    
-    scheduler = BackgroundScheduler()
-    
-    # Schedule signal generation (every hour and half-hour)
-    for s in FOREX_PAIRS:
-        scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', args=[s])
-    
-    # === Schedule daily report at 9:00 AM every day ===
-    scheduler.add_job(generate_daily_report, 'cron', hour=9, minute=0)
-    
-    # === Check trade outcomes every 30 minutes ===
-    scheduler.add_job(check_trade_outcomes, 'cron', minute='*/30')
-    
-    scheduler.start()
-    
-    # Run immediate baseline check in separate threads
-    for s in FOREX_PAIRS:
-        threading.Thread(target=generate_and_send_signal, args=(s,)).start()
-
-# Start bot outside main block for Gunicorn support
-start_bot()
-
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    # Calculate quick stats
-    total_trades = len(trade_history)
-    wins = len([t for t in trade_history if t['outcome'] == 'WIN'])
-    losses = len([t for t in trade_history if t['outcome'] == 'LOSS'])
-    win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-    total_pips = sum([t.get('profit_loss_pips', 0) for t in trade_history if t.get('outcome') in ['WIN', 'PARTIAL_WIN', 'LOSS']])
-    
-    return render_template_string("""
-        <body style="font-family:sans-serif; background:#020617; color:#f8fafc; text-align:center; padding-top:50px;">
-            <div style="background:#0f172a; display:inline-block; padding:40px; border-radius:12px; border:1px solid #1e293b; max-width:600px;">
-                <h1 style="color:#38bdf8;">Forex AI Pro Dashboard</h1>
-                <p style="font-size:1.2em;">Status: <span style="color:#4ade80;">Active</span></p>
-                <hr style="border-color:#1e293b;">
-                <div style="text-align:left; margin-top:20px;">
-                    <p><b>Analyses Streamed:</b> {{a}}</p>
-                    <p><b>Total Trades:</b> {{tt}}</p>
-                    <p><b>Win Rate:</b> {{wr:.1f}}%</p>
-                    <p><b>Total Pips:</b> {{tp:+.1f}}</p>
-                    <p><b>Version:</b> <i>{{v}}</i></p>
-                </div>
-                <hr style="border-color:#1e293b;">
-                <p style="font-size:0.8em; color:#94a3b8;">Last Analysis: {{t}}</p>
-            </div>
-        </body>
-    """, a=bot_stats['total_analyses'], v=bot_stats['version'], t=bot_stats['last_analysis'],
-         tt=total_trades, wr=win_rate, tp=total_pips)
-
-@app.route('/health')
-def health(): return jsonify({"status": "healthy"}), 200
-
-@app.route('/stats')
-def stats():
-    """API endpoint for forex trade statistics."""
-    wins = len([t for t in trade_history if t['outcome'] == 'WIN'])
-    partial = len([t for t in trade_history if t['outcome'] == 'PARTIAL_WIN'])
-    losses = len([t for t in trade_history if t['outcome'] == 'LOSS'])
-    active = len([t for t in trade_history if t['status'] == 'ACTIVE'])
-    total_pips = sum([t.get('profit_loss_pips', 0) for t in trade_history if t.get('outcome') in ['WIN', 'PARTIAL_WIN', 'LOSS']])
-    
-    return jsonify({
-        "total_trades": len(trade_history),
-        "wins": wins,
-        "partial_wins": partial,
-        "losses": losses,
-        "active": active,
-        "win_rate": (wins + partial) / (wins + partial + losses) * 100 if (wins + partial + losses) > 0 else 0,
-        "total_pips": round(total_pips, 1)
-    })
-
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+        logger.error(f"Bot crashed: {e}")
