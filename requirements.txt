@@ -8,4 +8,4 @@ setuptools
 wheel
 numpy<2.0.0
 pandas
-git+https://github.com/twopirllc/pandas-ta.git@development
+ta
