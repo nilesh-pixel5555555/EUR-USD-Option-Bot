@@ -1,27 +1,20 @@
-# Dockerfile
-
-# Use an official Python runtime as a base image
-FROM python:3.11-slim 
+# Use a stable Python version
+FROM python:3.9
 
 # Set the working directory
-WORKDIR /app 
+WORKDIR /app
 
-# Copy requirements file and install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt 
+# Install system dependencies (fixes the "git not found" error if it happens)
+RUN apt-get update && apt-get install -y git
 
-# Copy the rest of the application code (including main.py)
+# Copy your code into the container
 COPY . /app
 
-# The default command to run the application using Gunicorn
-# This loads the Flask app 'app' from the file 'main.py'
+# Install your Python libraries
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Dockerfile
+# Expose the port so Render can see the web server
+EXPOSE 10000
 
-# ... (All other instructions remain the same) ...
-
-# The default command to run the application using Gunicorn
-# This loads the Flask app 'app' from the file 'main.py'
-
-CMD gunicorn main:app --bind 0.0.0.0:$PORT
-
+# The command to run your bot
+CMD ["python", "main.py"]
